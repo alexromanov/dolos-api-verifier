@@ -1,0 +1,215 @@
+name: Dolos vs Blockfrost API Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  api-comparison-tests:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Start Dolos (Docker)
+      run: |
+        # Replace with your actual Dolos Docker setup
+        # docker-compose up -d dolos
+        # docker ps
+        echo "Dolos should be running on localhost:3000"
+    
+    - name: Wait for Dolos to be ready
+      run: |
+        # Wait for Dolos to be ready
+        timeout 60 bash -c 'until curl -f http://localhost:3000/network; do sleep 2; done'
+    
+    - name: Run API comparison tests
+      env:
+        BLOCKFROST_API_KEY: ${{ secrets.BLOCKFROST_API_KEY }}
+        DOLOS_BASE_URL: http://localhost:3000
+        BLOCKFROST_BASE_URL: https://cardano-preview.blockfrost.io/api/v0
+      run: |
+        pytest test_dolos_vs_blockfrost.py -v \
+          --html=report.html \
+          --self-contained-html \
+          --json-report \
+          --json-report-file=report.json
+    
+    - name: Generate test summary
+      if: always()
+      run: |
+        echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Extract summary from violations_report.json if it exists
+        if [ -f violations_report.json ]; then
+          echo "### Summary Statistics" >> $GITHUB_STEP_SUMMARY
+          python3 << 'EOF' >> $GITHUB_STEP_SUMMARY
+import json
+try:
+    with open('violations_report.json') as f:
+        report = json.load(f)
+        summary = report.get('summary', {})
+        print(f"- **Total Tests**: {summary.get('total_tests', 'N/A')}")
+        print(f"- **Passed**: {summary.get('passed', 'N/A')}")
+        print(f"- **Failed**: {summary.get('failed', 'N/A')}")
+        print(f"- **Violations**: {summary.get('violation_count', 'N/A')}")
+except Exception as e:
+    print(f"Could not parse report: {e}")
+EOF
+        fi
+    
+    - name: Upload test reports
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-reports-python-${{ matrix.python-version }}
+        path: |
+          report.html
+          report.json
+          violations_report.json
+        retention-days: 30
+    
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request' && always()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = '## API Comparison Test Results\n\n';
+          
+          try {
+            const report = JSON.parse(fs.readFileSync('violations_report.json', 'utf8'));
+            const summary = report.summary;
+            
+            comment += `- **Total Tests**: ${summary.total_tests}\n`;
+            comment += `- **Passed**: ✅ ${summary.passed}\n`;
+            comment += `- **Failed**: ❌ ${summary.failed}\n`;
+            comment += `- **Violations**: ${summary.violation_count}\n\n`;
+            
+            if (summary.failed > 0) {
+              comment += '### Violations Found\n\n';
+              report.violations.slice(0, 5).forEach(v => {
+                comment += `- **${v.test_name}**\n`;
+                comment += `  - Endpoint: \`${v.endpoint}\`\n`;
+              });
+              
+              if (report.violations.length > 5) {
+                comment += `\n*... and ${report.violations.length - 5} more violations*\n`;
+              }
+            }
+          } catch (e) {
+            comment += 'Could not parse test results.\n';
+          }
+          
+          comment += '\n[View detailed reports in artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+    
+    - name: Fail if critical violations found
+      if: always()
+      run: |
+        if [ -f violations_report.json ]; then
+          python3 << 'EOF'
+import json
+import sys
+
+with open('violations_report.json') as f:
+    report = json.load(f)
+    
+    # Check for critical violations
+    has_critical = False
+    for violation in report.get('violations', []):
+        violation_text = str(violation).lower()
+        if 'critical' in violation_text or 'hash' in violation_text:
+            has_critical = True
+            break
+    
+    if has_critical:
+        print("❌ Critical violations found!")
+        sys.exit(1)
+    else:
+        print("✅ No critical violations")
+EOF
+        fi
+    
+    - name: Stop Dolos
+      if: always()
+      run: |
+        # docker-compose down
+        echo "Dolos stopped"
+
+  # Separate job for generating comparison report
+  generate-comparison-report:
+    needs: api-comparison-tests
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Generate consolidated report
+      run: |
+        echo "# Consolidated API Comparison Report" > consolidated_report.md
+        echo "" >> consolidated_report.md
+        echo "Generated: $(date)" >> consolidated_report.md
+        echo "" >> consolidated_report.md
+        
+        for dir in test-reports-*; do
+          if [ -d "$dir" ]; then
+            echo "## $dir" >> consolidated_report.md
+            if [ -f "$dir/violations_report.json" ]; then
+              python3 << EOF >> consolidated_report.md
+import json
+with open('$dir/violations_report.json') as f:
+    report = json.load(f)
+    print(f"- Total: {report['summary']['total_tests']}")
+    print(f"- Passed: {report['summary']['passed']}")
+    print(f"- Failed: {report['summary']['failed']}")
+EOF
+            fi
+            echo "" >> consolidated_report.md
+          fi
+        done
+    
+    - name: Upload consolidated report
+      uses: actions/upload-artifact@v3
+      with:
+        name: consolidated-report
+        path: consolidated_report.md
